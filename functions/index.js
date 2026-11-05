@@ -62,6 +62,28 @@ exports.handler = async (e) => {
 
   let { url: r } = e.queryStringParameters;
 
+  // Handle URL reconstruction if client sent unencoded nested query params (e.g. ?url=https://...?token=...)
+  if (r && e.rawQuery) {
+    const rawMatch = e.rawQuery.match(/(?:^|&)url=([^&]+(?:\?[^&]+)?(?:&(?!(?:jpeg|bw|quality|l|max_width)=)[^&]+)*)/);
+    if (rawMatch && rawMatch[1]) {
+      try {
+        const decoded = decodeURIComponent(rawMatch[1]);
+        if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+          r = decoded;
+        }
+      } catch {}
+    }
+  } else if (r && e.queryStringParameters) {
+    const knownParams = new Set(['url', 'jpeg', 'bw', 'quality', 'l', 'max_width']);
+    const extraParams = Object.entries(e.queryStringParameters)
+      .filter(([k]) => !knownParams.has(k))
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    if (extraParams && !r.includes(extraParams)) {
+      r += (r.includes('?') ? '&' : '?') + extraParams;
+    }
+  }
+
   // jpeg:      "1" = use JPEG (client has no WebP), "0" or absent = use WebP
   // bw:        "1" = grayscale, "0" or absent = colour
   // quality/l: compression quality 1–100.
@@ -109,7 +131,8 @@ exports.handler = async (e) => {
         r,
         {
           headers: {
-            ...pick(e.headers, ["cookie", "dnt", "referer"]),
+            ...pick(e.headers, ["cookie", "dnt"]),
+            "referer": e.headers["referer"] || (parsedUrl.origin + "/"),
             "user-agent":
               e.headers["user-agent"] ||
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -175,8 +198,19 @@ exports.handler = async (e) => {
     );
 
     if (err) {
-      console.log("Compression failed:", r);
-      throw err;
+      // If Sharp cannot decode this image format (e.g. JPEG XL / JXL), fallback to delivering raw image instead of 500/404
+      console.warn("Compression failed, bypassing compression:", err.message || err);
+      return {
+        statusCode:      200,
+        body:            body.toString("base64"),
+        isBase64Encoded: true,
+        headers: {
+          ...CORS_HEADERS,
+          ...CACHE_HEADERS,
+          "content-encoding": "identity",
+          ...upstreamHeaders,
+        },
+      };
     }
 
     console.log(
